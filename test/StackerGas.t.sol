@@ -3,7 +3,8 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {BaseTest} from "./Base.t.sol";
-import {Stacker} from "../src/Stacker.sol";
+import {Stacker, IStakedIMD} from "../src/Stacker.sol";
+import {LateFailureVault} from "./StackerExternalCalls.t.sol";
 
 /// @dev Test-only integration of the README's gas guard, bounded call and plain-IMD fallback.
 contract GasBudgetProject {
@@ -110,5 +111,76 @@ contract StackerGasTest is BaseTest {
         assertEq(imd.balanceOf(address(stacker)), 0);
         assertEq(stacker.totalStacked(), 0);
         assertEq(imd.allowance(address(stacker), address(sImd)), 0);
+    }
+
+    function test_readmeFallbackAfterFirstMintReturnsZeroShares() public {
+        _fallbackAfterMint(1, false, true);
+    }
+
+    function test_readmeFallbackAfterRepeatMintReverts() public {
+        _fallbackAfterMint(10e18, true, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_readmeLateFailurePaysOnceAndNextCreditWorks(
+        uint96 amount,
+        bool initialized,
+        bool zeroReturn
+    ) public {
+        _fallbackAfterMint(bound(amount, 1, 50_000e18), initialized, zeroReturn);
+    }
+
+    /// @dev Exercise the existing README integration with failure AFTER both transfers and
+    /// a real share mint. The catch must pay from the restored project balance exactly once.
+    function _fallbackAfterMint(uint256 amount, bool initialized, bool zeroReturn) internal {
+        LateFailureVault vault = new LateFailureVault(address(imd), OWNER);
+        sImd = vault;
+        stacker = new Stacker(IERC20(address(imd)), IStakedIMD(address(vault)));
+        hook = new GasBudgetProject(stacker, IERC20(address(imd)));
+        uint256 seed = initialized ? 1e18 : 0;
+        deal(address(imd), address(hook), seed + 2 * amount);
+        if (initialized) {
+            assertEq(hook.pay{gas: 411_000}(trader, seed), seed * SHARES_PER_IMD);
+        }
+        uint256 oldHold = vault.lastDepositBlock(trader);
+        vm.roll(block.number + 1);
+
+        vault.setFailure(zeroReturn ? 2 : 1);
+        vm.expectCall(address(vault), abi.encodeCall(IStakedIMD.deposit, (amount, trader)));
+        assertEq(hook.pay{gas: 411_000}(trader, amount), 0, "fallback returns no shares");
+        assertEq(imd.balanceOf(trader), amount, "plain IMD paid exactly once");
+        assertEq(imd.balanceOf(address(hook)), amount, "failed credit did not also charge project");
+        assertEq(vault.totalAssets(), seed, "failed deposit left no assets in vault");
+        assertEq(vault.totalSupply(), seed * SHARES_PER_IMD, "failed mint unwound");
+        assertEq(vault.balanceOf(trader), seed * SHARES_PER_IMD);
+        assertEq(vault.lastDepositBlock(trader), oldHold, "failed mint did not renew hold");
+        assertEq(vault.maxRedeem(trader), seed * SHARES_PER_IMD);
+        assertEq(stacker.totalStacked(), seed, "plain IMD is not counted as staked cashback");
+        assertEq(stacker.projectStacked(address(hook)), seed);
+        assertEq(stacker.projectShares(address(hook)), seed * SHARES_PER_IMD);
+        assertEq(imd.allowance(address(hook), address(stacker)), type(uint256).max);
+        assertEq(
+            imd.allowance(address(stacker), address(vault)),
+            initialized ? type(uint256).max : 0,
+            "only a successful first credit can retain initialization"
+        );
+        assertEq(imd.balanceOf(address(stacker)), 0);
+        assertEq(vault.balanceOf(address(stacker)), 0);
+
+        vault.setFailure(0);
+        uint256 minted = hook.pay{gas: 411_000}(trader, amount);
+        assertEq(minted, amount * SHARES_PER_IMD, "retry must take the staking path");
+        assertEq(imd.balanceOf(trader), amount, "successful retry must not pay fallback too");
+        assertEq(imd.balanceOf(address(hook)), 0, "retry spends the remaining project balance");
+        assertEq(vault.totalAssets(), seed + amount);
+        assertEq(vault.totalSupply(), (seed + amount) * SHARES_PER_IMD);
+        assertEq(vault.balanceOf(trader), (seed + amount) * SHARES_PER_IMD);
+        assertEq(vault.lastDepositBlock(trader), block.number);
+        assertEq(stacker.totalStacked(), seed + amount);
+        assertEq(stacker.projectStacked(address(hook)), seed + amount);
+        assertEq(stacker.projectShares(address(hook)), (seed + amount) * SHARES_PER_IMD);
+        assertEq(imd.allowance(address(stacker), address(vault)), type(uint256).max);
+        assertEq(imd.balanceOf(address(stacker)), 0);
+        assertEq(vault.balanceOf(address(stacker)), 0);
     }
 }
