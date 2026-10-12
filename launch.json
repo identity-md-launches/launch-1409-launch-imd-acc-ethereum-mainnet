@@ -4,8 +4,8 @@
     {
       "contract": "Stacker",
       "constructorArgs": [
-        "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7",
-        "0x9Efa934D9fAd4AE28c998a40195646b965a97247"
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+        "0x9efa934d9fad4ae28c998a40195646b965a97247"
       ]
     }
   ],
