@@ -47,7 +47,7 @@
 1. A trader trades in a participating pool, for example PLEA/IMD.
 2. The project's hook takes its cashback rate (0.25%–1%) of the trade on the IMD side, so IMD-paired pools need no extra swap.
 3. The hook calls `Stacker.credit(trader, amount)`. The Stacker pulls the IMD and deposits it into the sIMD vault with the trader as the receiver.
-4. The trader's sIMD balance goes up. They can unstake any time, except in the block where new shares arrive (the vault's one-block hold).
+4. The trader's sIMD balance goes up. Withdrawals and redemptions are blocked in any block in which the vault mints them positive shares (the vault's one-block hold); transfers also carry the sender's hold forward. Anyone can renew a trader's hold with a tiny deposit, including a 1-wei IMD `credit`, or by depositing directly into sIMD. An exit therefore needs a block without a renewed hold; it is not guaranteed to succeed in the next block. This is a property of the existing vault, whose owner has renounced.
 
 ## The Stacker contract
 
@@ -62,14 +62,14 @@ event Stacked(address indexed project, address indexed trader, uint256 imd, uint
 |---|---|
 | Project | `msg.sender`. Any contract or wallet can call `credit`; [points](#points) decide who counts. |
 | Flow | Pulls `imdAmount` IMD from the caller, then calls `sIMD.deposit(imdAmount, trader)`. |
-| Holds nothing | 0 IMD and 0 sIMD between calls (tested as an invariant). |
+| Holds nothing | `credit` leaves 0 IMD and 0 sIMD in the Stacker (tested as an invariant). Do not send tokens directly to it: unsolicited transfers cannot be recovered. |
 | Fixed | IMD and sIMD addresses are immutable. The constructor only stores them and makes no external call (an IMD launch rule); the first non-zero `credit` checks `sIMD.asset() == IMD` and approves the vault once, and a failed credit rolls both back. |
 | Totals on chain | Per project (`projectStacked`, `projectShares`) and in total (`totalStacked`). |
 | Per trader | From the `Stacked` events, which record project, trader, IMD and shares for every credit. Storing them on chain too would cost every trader extra gas, so the mainnet Stacker doesn't. |
-| Failures | Reverts and moves nothing if the vault is paused, the allowance or balance is short, the trader is zero, or the vault would mint 0 shares. A 0 amount returns 0 with no event. |
+| Failures | Reverts and moves nothing if the vault is paused, the allowance or balance is short, the trader is zero (`ZeroTrader`), the trader is the Stacker or the vault itself (`InvalidTrader`), or the vault would mint 0 shares. A 0 amount with a valid trader returns 0 with no event. |
 | Safety | `nonReentrant`, OpenZeppelin `SafeERC20`, no owner or admin functions at all. |
 
-Source: [`src/Stacker.sol`](src/Stacker.sol), the exact contract live on Sepolia since test run 2 (launch #1294). The first Sepolia Stacker (launch #1129) also stored per-trader totals on chain (`traderStacked`, `stackedBy`, `traderShares`).
+Source: [`src/Stacker.sol`](src/Stacker.sol), based on the contract live on Sepolia since test run 2 (launch #1294), with the mainnet audit's additional rejection of the Stacker and vault as share recipients. See [`ADAPTATION.md`](ADAPTATION.md) for the change and its regression tests. The first Sepolia Stacker (launch #1129) also stored per-trader totals on chain (`traderStacked`, `stackedBy`, `traderShares`).
 
 ## Deployments
 
@@ -112,6 +112,10 @@ The test run 2 site still reads test run 2's registry.
 | sIMD | [`0x9efa934d9fad4ae28c998a40195646b965a97247`](https://etherscan.io/address/0x9efa934d9fad4ae28c998a40195646b965a97247) | ERC-4626 staking vault. Owner renounced, so nobody can pause it or sweep its funds. |
 | Stacker | not deployed yet | Launch ready: [`jobs/4-mainnet-launch.md`](jobs/4-mainnet-launch.md), deploying [`src/Stacker.sol`](src/Stacker.sol) as listed in [`launch.json`](launch.json). |
 
+This launch deploys only the Stacker. The mainnet ProjectRegistry is a later launch; the test tokens and vault are not deployed here. After the deployment service confirms the mainnet address, replace the pending Stacker entry above with that address and its deployment transaction/block.
+
+**First-credit handoff:** deployment does not check or approve the vault. Before enabling projects, the launch operator can approve the confirmed Stacker from their own funded wallet, then call `credit(theirOwnWallet, amount)` with a small positive amount for which `sIMD.previewDeposit(amount) > 0`, using the first-credit gas budget below. Confirm the successful `Stacked` event and IMD allowance from the Stacker to sIMD, then record the priming transaction/block in the Stacker row above. A failed or zero-amount credit does not prime it. No priming transaction has been made by this repository adaptation; integrations must support the first-credit budget even if no operator primes it. A self-credit earns no project points.
+
 ## Points
 
 Every `Stacked` event is kept as a record. Points are the basis for the leaderboards and maybe a later airdrop; **nothing is promised**.
@@ -147,7 +151,9 @@ IERC20(imd).approve(address(stacker), type(uint256).max);
 
 // On each trade, with the real trader taken from hookData:
 uint256 cashback = imdSideAmount * RATE_BPS / 10_000;        // your rate: 25-100 bps (0.25%-1%), out of your fee
-try stacker.credit(trader, cashback) {
+// At the call site: fund even the first-ever credit and retain gas for the fallback.
+require(gasleft() >= 410_000, "imd/acc: insufficient gas");
+try stacker.credit{gas: 350_000}(trader, cashback) {
     // the trader now holds the sIMD
 } catch {
     IERC20(imd).transfer(trader, cashback);                  // plain IMD: the trade never reverts
@@ -157,16 +163,16 @@ try stacker.credit(trader, cashback) {
 Rules:
 1. **Fund it from your fee.** Pick a rate from 0.25% to 1% and take it on the IMD side of the trade, out of the fee you already charge. The part of your fee that leaves you (liquidity, burns, prizes) must be at least as large as the cashback, or the listing is refused.
 2. **Never let imd/acc break a trade.** Wrap `credit` in `try/catch` and pay plain IMD if it fails.
-3. **Pay the real trader.** Read it from the router's `hookData`, fall back to `sender`, never use `tx.origin`.
-4. **Check gas before the call.** Require enough gas for `credit` up front and revert if it's short. Otherwise a wallet's gas estimate picks the cheaper path without cashback, and traders get plain IMD. PLEA learned this on Sepolia.
-5. **Budget the gas.** Measured costs of `credit` (whole transactions):
+3. **Pay the real trader.** Read it from the router's `hookData`, fall back to `sender`, never use `tx.origin`. Validate the resolved recipient; the zero address, Stacker and vault are invalid recipients. Catching an invalid-recipient error does not correct a wrongly resolved trader for the plain-IMD fallback.
+4. **Check gas before the call.** Require enough gas for `credit` up front and revert if it's short. Otherwise a wallet's gas estimate picks the cheaper path without cashback, and traders get plain IMD. PLEA learned this on Sepolia. The example always forwards 350k gas, including on the first-ever credit, with a 410k `gasleft()` check immediately before the call. The extra 60k allows for call overhead, EIP-150's forwarding limit and the plain-IMD fallback. Increase the reserve for any remaining work in your hook, and test the complete trade. Keep this check outside `try/catch`; a failed credit is caught, an underfunded transaction must be estimated again.
+5. **Budget the gas.** Reference costs of `credit` (whole transactions, before the mainnet recipient guard; rounded):
 
-   | Network | New trader | Repeat trader |
-   |---|---|---|
-   | Ethereum mainnet (this Stacker, fork test) | 136k | 102k |
-   | Sepolia (the launch #1129 Stacker; today's expensive new storage) | 0.7M–1.2M | about 0.2M |
+   | Network | First-ever credit | New trader after initialization | Repeat trader |
+   |---|---|---|---|
+   | Ethereum mainnet (fork, block 26,173,849) | 232k | 136k | 102k |
+   | Sepolia (the launch #1129 Stacker; per-trader storage) | not measured | 0.7M–1.2M | about 0.2M |
 
-   Wallets should send estimates ×1.3.
+   The first successful non-zero credit also validates `sIMD.asset()` and establishes the Stacker's vault approval. A 177k cap derived from 136k ×1.3 runs out of gas on a fresh Stacker, rolls back initialization, and can keep every later trade on plain IMD. These receipt costs are not safe call-gas caps: refunds, cold accesses, and a project's first credit affect the gas needed during execution. The 350k call budget above is tested against both the local vault copy and the live mainnet pair, including a cold first credit. Wallets should send estimates ×1.3 for the complete trade, after the hook enforces its gas check; do not reduce the first-credit budget to the new-trader figure.
 6. **For Uniswap v4 hooks:** include the `afterSwap` logic Uniswap's frontend whitelisting expects, support the router's `msgSender`, and warn users about copycat v2/v3 pools. These are btc/acc's lessons.
 7. **Test the failure path** on Sepolia: TestSIMD's owner can pause it, and your hook should then pay plain IMD.
 
@@ -231,13 +237,13 @@ With [Foundry](https://getfoundry.sh) 1.8.3, the version IMD's verifier runs:
 
 ```
 forge build
-forge test                                                        # 180 tests; the 8 fork tests skip
+forge test                                                        # offline tests run; fork tests skip without RPC URLs
 ETH_RPC_URL=https://ethereum-rpc.publicnode.com forge test --mc MainnetFork            # live IMD and sIMD
 SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com forge test --mc SepoliaFork # live TestIMD and TestSIMD; RegistrySepoliaFork: the real Intake v2
 forge fmt --check src test
 ```
 
-The mainnet fork tests check the live vault's facts (asset, renounced owner, not paused), a credit to a new and a repeat trader, and the one-block hold followed by a redeem. The Sepolia ones check a credit, its event and totals, and that a paused vault makes `credit` revert without moving anything; the registry's fork test sends a real application to Intake v2 and settles it.
+The mainnet fork tests check the live vault's facts (asset, renounced owner, not paused), a credit to a new and a repeat trader, the one-block hold followed by a redeem, and first-credit gas budgeting. Offline audit regressions cover unreachable recipients and atomic rejection, the gas guard and plain-IMD fallback (including exhausted call gas), and third-party dust deposits renewing the vault hold. The Sepolia ones check a credit, its event and totals, and that a paused vault makes `credit` revert without moving anything; the registry's fork test sends a real application to Intake v2 and settles it.
 
 **Branches:** `main` holds the mainnet manifest (the Stacker only). The `sepolia` branch differs only in `launch.json`: the same Stacker wired to the live Sepolia TestIMD and TestSIMD, plus the ProjectRegistry.
 
