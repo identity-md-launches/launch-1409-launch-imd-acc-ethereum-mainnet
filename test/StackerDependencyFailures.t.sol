@@ -7,13 +7,16 @@ import {TestSIMD} from "./mocks/TestSIMD.sol";
 import {Stacker, IStakedIMD} from "src/Stacker.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
 /// @dev Fault injection at Stacker's calls, after the normal token effects. These modes are not
 /// claims about live IMD: they test whether a dependency failure can leave partial cashback.
 contract FailureResponseIMD is TestIMD {
     address public stacker;
+    address public vault;
     uint8 public approvalFailure;
     uint8 public pullFailure;
+    uint8 public vaultPullFailure;
 
     error TokenRejected();
 
@@ -23,6 +26,11 @@ contract FailureResponseIMD is TestIMD {
         pullFailure = pullMode;
     }
 
+    function configureVaultPull(address target, uint8 mode) external {
+        vault = target;
+        vaultPullFailure = mode;
+    }
+
     function approve(address spender, uint256 amount) public override returns (bool) {
         super.approve(spender, amount);
         return _response(msg.sender == stacker ? approvalFailure : 0);
@@ -30,6 +38,7 @@ contract FailureResponseIMD is TestIMD {
 
     function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
         super.transferFrom(from, to, amount);
+        if (msg.sender == vault) return _response(vaultPullFailure);
         return _response(msg.sender == stacker ? pullFailure : 0);
     }
 
@@ -124,6 +133,43 @@ contract StackerDependencyFailuresTest is BaseTest {
         _reject(amount, expected);
         assertEq(_state(), before_, "dependency error left partial state");
         token.configure(address(stacker), 0, 0);
+        _recover(initialized, amount);
+    }
+
+    function test_falseVaultPullRollsBackBothTransfersAndFirstApproval() public {
+        _vaultPullFailure(1, false, 1);
+    }
+
+    function test_revertingVaultPullAfterEarlierCreditLeavesMatureSharesAlone() public {
+        _vaultPullFailure(2, true, 1e18);
+    }
+
+    function test_invalidBooleanVaultPullRollsBackEntireProjectBalance() public {
+        _vaultPullFailure(3, false, imd.balanceOf(project));
+    }
+
+    function testFuzz_vaultPullFailureIsAtomic(uint8 mode, uint96 amount, bool initialized) public {
+        _vaultPullFailure(uint8(bound(mode, 1, 3)), initialized, bound(amount, 1, 50_000e18));
+    }
+
+    /// @dev The project pull succeeds; only the vault's second transfer fails, after moving
+    /// the IMD. This boundary uses the vault's transfer library, not Stacker's SafeERC20.
+    function _vaultPullFailure(uint8 mode, bool initialized, uint256 amount) internal {
+        if (initialized) _credit(10e18);
+        vm.roll(block.number + 1);
+        bytes32 before_ = _state();
+        token.configureVaultPull(address(vault), mode);
+        vm.expectCall(
+            address(token), abi.encodeCall(IERC20.transferFrom, (project, address(stacker), amount))
+        );
+        vm.expectCall(
+            address(token),
+            abi.encodeCall(IERC20.transferFrom, (address(stacker), address(vault), amount))
+        );
+        // Solady wraps all three token failure responses in the vault's own error.
+        _reject(amount, abi.encodeWithSelector(SafeTransferLib.TransferFromFailed.selector));
+        assertEq(_state(), before_, "vault pull failure retained part of the credit");
+        token.configureVaultPull(address(vault), 0);
         _recover(initialized, amount);
     }
 
