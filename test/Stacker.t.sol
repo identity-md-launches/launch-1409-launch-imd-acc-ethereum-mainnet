@@ -365,7 +365,10 @@ contract StackerTest is BaseTest {
 
     function testFuzz_credit(address who, uint256 amount) public {
         // Invalid recipients have dedicated rejection coverage in StackerAuditRegression.t.sol.
-        vm.assume(who != address(0) && who != address(stacker) && who != address(sImd));
+        vm.assume(
+            who != address(0) && who != address(stacker) && who != address(sImd)
+                && who != address(imd)
+        );
         amount = bound(amount, 1, 1_000_000e18);
         uint256 preview = sImd.previewDeposit(amount);
 

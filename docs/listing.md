@@ -47,24 +47,26 @@ One file per chain: [`listings/sepolia.json`](../listings/sepolia.json) now, `li
 - [ ] The cashback is the stated `rateBps` of the trade, between 25 and 100.
 - [ ] **Fee guard:** the part of the fee that really leaves the project is at least as large as the cashback (see below).
 - [ ] If its rate or fees can change later, the limits are in the code: every allowed rate stays between 25 and 100, and every allowed setting keeps the fee guard. A change inside those limits keeps the listing.
-- [ ] It credits the real trader: router `hookData`, else `sender`, never `tx.origin`.
+- [ ] It resolves the real trader from valid router `hookData`, else the router's active `msgSender()`, else `sender` only if it has no code; never `tx.origin`. Validate destinations and use the same resolved trader for plain-IMD fallback. Invalid data may fall back to a separately resolved caller; an unknown router is never paid. Unsupported routes need trader data before cashback is enabled (README rule 3).
 - [ ] A failed credit never blocks a trade: the trader gets plain IMD instead.
 - [ ] It checks gas up front, so a wallet's gas estimate can't choose a path without cashback.
 
 ### The fee guard
 
-A normal trader can't farm points: they pay the whole fee and get back only the cashback, which is smaller. A project owner also gets back their own share of the fee, so trading with themselves could be nearly free. Split the fee into three parts:
+Cashback alone does not measure the cost of farming points: an owner can recover their own fee share, and a trader who is also an LP can recover most of the LP fee. Split the fee into three parts and exclude those returns:
 
 | Part | Examples | Counts as "leaves"? |
 |---|---|---|
 | Cashback | the trader's sIMD | no |
 | Comes back to the owner | owner share, team treasury, liquidity the owner can withdraw | no |
-| Really leaves | burned tokens, liquidity locked forever, prizes paid to other people, fees to third parties | **yes** |
+| LP fees or other returns to the trader | fees paid to an LP, even a third-party LP, who may be the trader | no |
+| Qualifying outflow | burned tokens, liquidity locked forever, prizes to others, third-party payments; excluding amounts returned to the trader, owner or team | **yes** |
 
-**Rule: "really leaves" ≥ cashback.** Then every point an owner farms costs at least as much as it returns, plus price impact and gas.
+**Rule: qualifying outflow ≥ cashback, for every allowed setting.** LP fees never satisfy this floor. Locked liquidity means principal that cannot be withdrawn by the owner or team, not fees claimable by an LP. Listing checks enforce this policy; they do not prove every trader's net cost or rule out coordinated farming.
 
-- **PLEA passes:** fee 1.75% = 0.5% cashback + 0.5% owner + 0.25% locked liquidity + 0.25% burn + 0.25% season prizes. Leaves 0.75% ≥ 0.5%. An owner round trip of $10,000 costs $350 in fees, gets back $200 ($100 cashback, $100 owner share) and loses $150 for $100 of points.
+- **Illustrative split:** fee 1.75% = 0.5% cashback + 0.5% owner + 0.25% locked liquidity + 0.25% burn + 0.25% season prizes. The nominal 0.75% outflow exceeds 0.5% cashback only to the extent it qualifies under the rule above; a project's verified code must establish this before listing. This is not a fresh approval of PLEA or proof of a wash trader's net cost.
 - **Fails:** fee 1.25% = 1% cashback + 0.25% owner. Nothing leaves, so points are almost free. Such a project can still use imd/acc, unlisted.
+- **Also fails:** 1% cashback plus 1% LP fees and no other qualifying outflow. A trader providing 99% of the liquidity recovers 99% of those LP fees. On two legs each normalized to 1,000 IMD, 20 IMD cashback accompanies only 0.2 IMD of net fee cost, before gas and price movement; the gross LP fee is not a farming-cost floor.
 
 ### When points start
 
@@ -92,5 +94,7 @@ A small on-chain contract with **no owner** ([`src/ProjectRegistry.sol`](../src/
 3. **No answer** (the panel split or the question was refused): the application is cleared and can be sent again at once. Nothing is listed.
 4. **Challenge.** Anyone can challenge a listed project, after a cooldown, by paying the oracle fee plus a bond. If the panel says it still meets the rules, it stays listed and **the bond goes to the project's beneficiary**; if not, it is delisted from that block, earlier points stay, and the challenger gets the bond back.
 5. **Points** count a project's credits inside its listing periods only.
+
+**Application liveness is not guaranteed by the current registry.** A stranger can hold the single open-question slot, then reapply immediately after a signed no, failure or expiry, paying only the oracle fee each time. There is no application bond or priority for the legitimate team. This remains an open policy issue for the later registry launch; the mainnet Stacker launch does not deploy or consult this registry.
 
 The full design, the checks every answer must pass, and the known limits are in [design.md](design.md#the-projectregistry).

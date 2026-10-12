@@ -9,14 +9,14 @@ The [README](../README.md) is the overview. This file keeps the design detail an
 | `Stacker` (shared contract) | `credit(trader, imdAmount)`: pulls IMD from the caller and calls `sIMD.deposit(amount, trader)`. The caller is the project. Emits `Stacked(project, trader, imd, shares)` and keeps per-project totals on chain. No owner; the IMD and sIMD addresses are immutable. Deposits on every credit. |
 | Integration rule | The project wraps `credit` in `try/catch`. If it fails (vault paused, anything else), the hook sends the cashback to the trader as plain IMD instead, so **a trade never reverts because of imd/acc**. |
 | Drop-in hook (planned) | For IMD pools without their own hook. Takes the cashback in IMD in `afterSwap` and calls `credit`. Includes the `afterSwap` logic that Uniswap's frontend whitelisting needs (a btc/acc lesson). |
-| Trader identity | The router passes the real trader in `hookData`. Fall back to `sender`; never use `tx.origin`. |
+| Trader identity | Valid router `hookData`, else the router's active `msgSender()`, else `sender` only if it has no code; never `tx.origin`. Validate recipients and never pay an unresolved forwarding router. See README rule 3 for fallback and unsupported routes. |
 | Site | "Your stack" (sIMD from cashback, per project, and its IMD value now), plus leaderboards for top stackers and top projects. |
 
 ## Which projects earn points
 
 Anyone can call `credit` with their own IMD. That is just staking for someone, and it can't be blocked without giving the Stacker an owner. So points are counted, not gated: the Stacker records everything, and only credits from **listed projects** earn points. Every `Stacked` event names its project, so the list can be applied at any time.
 
-**Today (decided): a list file.** Credits from anything not on the list show as "direct, no points". Real trading points already cost money (fees paid to trade), so the only cheap attack was a fake project, and the list closes it. The first test page shipped its own `projects.json`; from Sepolia test run 2 the list is a file in this repository, `listings/<chain>.json`, so a listing is a commit, not a paid job. How a project applies, the checklist, the fee guard and delisting with `toBlock` are in [listing.md](listing.md).
+**Today (decided): a list file.** Credits from anything not on the list show as "direct, no points". The list excludes fake projects; trading fees alone do not rule out cheap point farming by traders who recover LP fees. The first test page shipped its own `projects.json`; from Sepolia test run 2 the list is a file in this repository, `listings/<chain>.json`, so a listing is a commit, not a paid job. How a project applies, the checklist, the fee guard and delisting with `toBlock` are in [listing.md](listing.md).
 
 **Points start at listing.** A listed project's credits earn points only from its `fromBlock`, never retroactively, so nobody can build fake history and then get approved. A project reviewed before or at launch gets its deploy block (PLEA's case).
 
@@ -85,7 +85,7 @@ Confirmed by the owner on 2026-10-11, for both chains.
 **Why these numbers.** On Sepolia the bond only tests the flow (test IMD is free), and a 1-hour cooldown lets the trial run its challenge step on the same day. On mainnet, 20 IMD (40 times the oracle fee) makes challenging a project just to annoy it costly, since a defended challenge pays the bond to the project, while staying within reach of someone who has really caught a project breaking the rules. Seven days gives a listed or defended project a quiet week; a project that starts cheating can still be challenged within a week, and its points stop from the block it is delisted.
 
 ### Known limits
-- **Blocking by spam:** someone can keep a project's application slot busy by applying for it with wrong terms, one question at a time. Each try costs them 0.5 IMD and lasts until the panel answers (minutes).
+- **Blocking by spam:** someone can keep a project's single application slot busy by applying with wrong terms. Each try costs only the oracle fee (0.5 IMD in the test settings), with no application bond; a signed no, failure or expiry permits immediate reapplication. A bot can occupy the slot again in the clearing transaction/block, so there is no bounded wait for the legitimate team. This needs a separate application-policy decision before the later mainnet registry launch. The Stacker does not depend on the registry.
 - **Fixed oracle settings:** the signer and the action id (`oracle.request@oracle-1`) are fixed in the contract; the fee is read live from the Intake, and a zero price (the action retired) makes asking revert. The cooldown is capped at 365 days. If IMD changes them, a new registry is deployed, and the site reads both, so listing history is kept.
 - **Writer trust:** the Intake's writer can withhold an answer or pair one with the wrong request. That suits a listing decision, which can wait and be challenged.
 
@@ -121,7 +121,7 @@ This history drives the leaderboards. If imd/acc takes off, it's the basis for a
 
 - **No contract change.** The Stacker never checked the rate: it stakes whatever amount the project sends. The rate is a listing rule.
 - **Points stay "1 per IMD stacked".** A project with a higher rate gives its traders more cashback and so more points. Points stay tied to real IMD that reached traders, which is easy to verify for any kind of project.
-- **The guard against farming.** A project owner who trades with themselves gets back the cashback and their own share of the fee. So the part of the fee that really leaves the project (to liquidity providers, burns, prizes) must be at least as large as the cashback. Then farming points always costs more than it brings back. PLEA: 0.5% cashback, 0.75% to liquidity, burn and prizes.
+- **Fee guard.** Qualifying fee outflow (burns, locked liquidity, prizes to others and third-party payments) must be at least as large as cashback. Exclude LP fees: a trader can also be the LP and recover them. Other amounts returned to the trader, owner or team do not qualify. The [listing rules](listing.md#the-fee-guard) apply at every allowed setting; they do not guarantee every trader's net farming cost.
 - **Listing.** Each listing records the rate the project applied with (`rateBps`, 25 to 100). The listing check (the list file, or the ProjectRegistry panel) reads the project's verified code to confirm the rate and the guard.
 - **Rate changes (decided 2026-10-11).** A listed project may change its rate within 25 to 100 bps and stays listed, provided its code enforces that range and keeps the fee guard true for every rate and fee split it allows. The panel checks this at application and at any challenge. Why: points are 1 per IMD that really reached traders, so a rate change inside the range fakes nothing, and delisting a project for an honest change would cost it its listing period and a new application. The condition closes the one gap: without it, a project could raise its rate past its guard right after listing, during the cooldown when nobody can challenge it.
 - **Indexer.** It compares each credit with the swap in the same transaction. A credit outside 25 to 100 bps of that trade, or with no trade on the project's pool, earns no points.
@@ -141,8 +141,8 @@ This history drives the leaderboards. If imd/acc takes off, it's the basis for a
 
 The only thing lost is that another contract can't ask the Stacker directly for one trader's total. A later airdrop would use a snapshot of points with claim proofs anyway.
 
-**Project points** are the IMD cashback a project paid its traders. It's real IMD that left the project, so it can't be faked cheaply. Rules for the indexer:
-- Count a project's credit only when the same transaction also has a swap on that project's pool, so a project can't credit its own wallets for points. Trading back and forth already costs more in fees than it earns.
+**Project points** are the IMD cashback a project paid its traders. They record real deposits, but deposit totals alone do not prove a trader's net cost. Rules for the indexer:
+- Count a project's credit only when the same transaction also has a swap on that project's pool. This excludes non-trade credits; it does not by itself detect wash trades or LP-fee rebates.
 - Show next to it: the project's rate, unique traders, number of trades, estimated volume (cashback ÷ the project's rate), all-time, 7-day and 30-day.
 - Each listing carries a `beneficiary` wallet (in `projects.json` now, in the registry later), because the project address is a hook contract that can't receive an airdrop.
 
@@ -254,7 +254,7 @@ Side benefit: POOL4 burns a cut of IMD on its trades, so every flush also burns 
 ## Open questions
 
 1. **Is an sIMD vault planned on Robinhood Chain?** IMD exists there (`0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127`, the same OFT), but no vault does. **Recommendation:** ask the IMD team whether they will deploy StakedIMD there; until then PondPad pays its cashback as plain IMD. A Stacker on Robinhood Chain is a one-contract launch once a vault exists.
-2. **Should sells get cashback too, or buys only?** (PLEA pays it on every trade.) **Recommendation:** both. Every trade pays a fee, so every trade funds its 0.5%; wash trading for points still loses money, because the fees on a round trip are larger than the cashback.
+2. **Should sells get cashback too, or buys only?** (PLEA pays it on every trade.) **Recommendation:** both. Every trade pays a fee, so every trade funds its 0.5%. Apply the fee guard to both sides; gross round-trip fees alone do not establish a wash trader's net cost.
 
 Known and harmless: a credit mints sIMD to the trader, and the vault's one-block hold then stops that trader from redeeming in the same block. Anyone can already do this by depositing into the vault for someone, so the Stacker adds nothing new.
 

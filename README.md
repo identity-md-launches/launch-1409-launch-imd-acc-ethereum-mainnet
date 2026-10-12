@@ -66,10 +66,10 @@ event Stacked(address indexed project, address indexed trader, uint256 imd, uint
 | Fixed | IMD and sIMD addresses are immutable. The constructor only stores them and makes no external call (an IMD launch rule); the first non-zero `credit` checks `sIMD.asset() == IMD` and approves the vault once, and a failed credit rolls both back. |
 | Totals on chain | Per project (`projectStacked`, `projectShares`) and in total (`totalStacked`). |
 | Per trader | From the `Stacked` events, which record project, trader, IMD and shares for every credit. Storing them on chain too would cost every trader extra gas, so the mainnet Stacker doesn't. |
-| Failures | Reverts and moves nothing if the vault is paused, the allowance or balance is short, the trader is zero (`ZeroTrader`), the trader is the Stacker or the vault itself (`InvalidTrader`), or the vault would mint 0 shares. A 0 amount with a valid trader returns 0 with no event. |
+| Failures | Reverts and moves nothing if the vault is paused, the allowance or balance is short, the trader is zero (`ZeroTrader`), the trader is the Stacker, IMD token or the vault itself (`InvalidTrader`), or the vault would mint 0 shares. A 0 amount with a valid trader returns 0 with no event. |
 | Safety | `nonReentrant`, OpenZeppelin `SafeERC20`, no owner or admin functions at all. |
 
-Source: [`src/Stacker.sol`](src/Stacker.sol), based on the contract live on Sepolia since test run 2 (launch #1294), with the mainnet audit's additional rejection of the Stacker and vault as share recipients. See [`ADAPTATION.md`](ADAPTATION.md) for the change and its regression tests. The first Sepolia Stacker (launch #1129) also stored per-trader totals on chain (`traderStacked`, `stackedBy`, `traderShares`).
+Source: [`src/Stacker.sol`](src/Stacker.sol), based on the contract live on Sepolia since test run 2 (launch #1294), with the mainnet audit's additional rejection of the Stacker, IMD token and vault as share recipients. See [`ADAPTATION.md`](ADAPTATION.md) for the changes and their regression tests. The first Sepolia Stacker (launch #1129) also stored per-trader totals on chain (`traderStacked`, `stackedBy`, `traderShares`).
 
 ## Deployments
 
@@ -122,7 +122,7 @@ Every `Stacked` event is kept as a record. Points are the basis for the leaderbo
 
 - **Trader points:** 1 point per IMD stacked for the trader. A project with a higher rate gives its traders more cashback, so more points.
 - **Project points:** the IMD its traders stacked.
-- **Rate and guard:** each listing records the rate the project applied with (0.25%–1%). A project may change its rate later, as long as it stays between 0.25% and 1%. To list, the part of the project's fee that really leaves it (to liquidity providers, burns, prizes) must be at least as large as its cashback, at every rate and fee split its code allows, so trading with yourself to farm points always costs more than it brings back. Credits outside 0.25%–1% of their trade earn no points.
+- **Rate and guard:** each listing records the rate the project applied with (0.25%–1%). A project may change its rate later, as long as it stays between 0.25% and 1%. To list, qualifying fee outflow (burns, locked liquidity, prizes to others and third-party payments) must be at least as large as cashback at every rate and fee split its code allows. LP fees do not count toward this floor: the trader may also be the LP and recover them. Amounts returned to the trader, owner or team do not qualify. This is a listing policy, not a guarantee about every trader's net cost or points-farming resistance. Credits outside 0.25%–1% of their trade earn no points.
 - **Listed projects only.** Anyone can call `credit` with their own IMD; that's just staking for someone, so it earns no points. Only credits from a listed project count, from the block it was listed (`fromBlock`), never before.
 - **Who is listed:** from Sepolia test run 2, an on-chain **ProjectRegistry** decides, with no owner: anyone applies with `applyListing`, an IdentityMD oracle panel answers yes or no against the rules, and anyone can challenge a listed project with a bond. Where no registry runs yet, a list file per chain in this repository is used instead. Steps, checklist, fee guard and delisting: [docs/listing.md](docs/listing.md).
 - **How they're counted:** by adding up the `Stacked` events, which can't be changed or deleted. An indexer keeps the totals ready for the site; project totals are also on chain.
@@ -149,7 +149,7 @@ The all-traders dashboard and leaderboards (top traders, top projects, 7-day and
 // Once: let the Stacker pull IMD from your contract.
 IERC20(imd).approve(address(stacker), type(uint256).max);
 
-// On each trade, with the real trader taken from hookData:
+// On each supported trade, with the real trader resolved and validated under rule 3:
 uint256 cashback = imdSideAmount * RATE_BPS / 10_000;        // your rate: 25-100 bps (0.25%-1%), out of your fee
 // At the call site: fund even the first-ever credit and retain gas for the fallback.
 require(gasleft() >= 410_000, "imd/acc: insufficient gas");
@@ -161,9 +161,9 @@ try stacker.credit{gas: 350_000}(trader, cashback) {
 ```
 
 Rules:
-1. **Fund it from your fee.** Pick a rate from 0.25% to 1% and take it on the IMD side of the trade, out of the fee you already charge. The part of your fee that leaves you (liquidity, burns, prizes) must be at least as large as the cashback, or the listing is refused.
+1. **Fund it from your fee.** Pick a rate from 0.25% to 1% and take it on the IMD side of the trade, out of the fee you already charge. Qualifying outflow (locked liquidity, burns, prizes to others, third-party payments) must be at least as large as cashback at every allowed setting, or the listing is refused. Exclude LP fees and amounts returned to the trader, owner or team.
 2. **Never let imd/acc break a trade.** Wrap `credit` in `try/catch` and pay plain IMD if it fails.
-3. **Pay the real trader.** Read it from the router's `hookData`, fall back to `sender`, never use `tx.origin`. Validate the resolved recipient; the zero address, Stacker and vault are invalid recipients. Catching an invalid-recipient error does not correct a wrongly resolved trader for the plain-IMD fallback.
+3. **Pay the real trader.** First decode valid trader data using the router's agreed `hookData` encoding. Otherwise, during the swap, try `IMsgSender(sender).msgSender()`; use `sender` itself only when it has no code. Never use `tx.origin` or substitute a forwarding router for an unresolved trader. Bound and catch the accessor call; reject failed, malformed, zero or self-referential results. Validate every recipient: zero, Stacker, IMD token, vault and forwarding routers are invalid destinations. Smart contract wallets remain valid when resolved through trader data or the router's active caller context. With invalid nonempty data, pay plain IMD to a valid independently resolved caller; if `credit` fails, pay plain IMD to the same valid resolved trader. If no valid trader can be resolved, skip the cashback branch without blocking the trade or sending either token to the router; that route must provide trader data before cashback is enabled. Such skipped payouts earn no points and must not be advertised as supported cashback.
 4. **Check gas before the call.** Require enough gas for `credit` up front and revert if it's short. Otherwise a wallet's gas estimate picks the cheaper path without cashback, and traders get plain IMD. PLEA learned this on Sepolia. The example always forwards 350k gas, including on the first-ever credit, with a 410k `gasleft()` check immediately before the call. The extra 60k allows for call overhead, EIP-150's forwarding limit and the plain-IMD fallback. Increase the reserve for any remaining work in your hook, and test the complete trade. Keep this check outside `try/catch`; a failed credit is caught, an underfunded transaction must be estimated again.
 5. **Budget the gas.** Reference costs of `credit` (whole transactions, before the mainnet recipient guard; rounded):
 
@@ -173,8 +173,10 @@ Rules:
    | Sepolia (the launch #1129 Stacker; per-trader storage) | not measured | 0.7M–1.2M | about 0.2M |
 
    The first successful non-zero credit also validates `sIMD.asset()` and establishes the Stacker's vault approval. A 177k cap derived from 136k ×1.3 runs out of gas on a fresh Stacker, rolls back initialization, and can keep every later trade on plain IMD. These receipt costs are not safe call-gas caps: refunds, cold accesses, and a project's first credit affect the gas needed during execution. The 350k call budget above is tested against both the local vault copy and the live mainnet pair, including a cold first credit. Wallets should send estimates ×1.3 for the complete trade, after the hook enforces its gas check; do not reduce the first-credit budget to the new-trader figure.
-6. **For Uniswap v4 hooks:** include the `afterSwap` logic Uniswap's frontend whitelisting expects, support the router's `msgSender`, and warn users about copycat v2/v3 pools. These are btc/acc's lessons.
+6. **For Uniswap v4 hooks:** include the `afterSwap` logic Uniswap's frontend whitelisting expects, resolve the router's `msgSender()` as required by rule 3 (including empty `hookData`), and warn users about copycat v2/v3 pools. These are btc/acc's lessons.
 7. **Test the failure path** on Sepolia: TestSIMD's owner can pause it, and your hook should then pay plain IMD.
+
+In v4, the hook's `sender` is the caller of PoolManager, commonly a router; it is not necessarily the trader ([Uniswap hook calls](https://github.com/Uniswap/v4-core/blob/main/src/libraries/Hooks.sol)). Universal Router exposes the active caller through [`msgSender()`](https://github.com/Uniswap/universal-router/blob/main/contracts/base/Dispatcher.sol), and tokens paid to the router can be taken through its [sweep command](https://github.com/Uniswap/universal-router/blob/main/contracts/modules/Payments.sol). [`test/TraderResolution.t.sol`](test/TraderResolution.t.sol) reproduces that loss and exercises the corrected resolution and fallback with a minimal router model; its packed 20-byte trader format is an example, not a universal `hookData` format.
 
 ## Projects
 

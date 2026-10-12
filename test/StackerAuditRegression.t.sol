@@ -21,9 +21,14 @@ contract StackerAuditRegressionTest is BaseTest {
         _reject(address(sImd), 1e18);
     }
 
+    function test_creditToImdTokenRevertsWithoutEffects() public {
+        _reject(address(imd), 1e18);
+    }
+
     function test_zeroAmountStillRejectsUnreachableRecipients() public {
         _reject(address(stacker), 0);
         _reject(address(sImd), 0);
+        _reject(address(imd), 0);
     }
 
     function testFuzz_unreachableRecipientsRejectedBeforeAndAfterFirstCredit(
@@ -37,6 +42,7 @@ contract StackerAuditRegressionTest is BaseTest {
         // Even zero or an unfundable amount must fail recipient validation first.
         _reject(address(stacker), amount);
         _reject(address(sImd), amount);
+        _reject(address(imd), amount);
 
         // Rejections must not poison the guard or prevent a valid subsequent credit.
         vm.prank(project);
@@ -72,9 +78,11 @@ contract StackerAuditRegressionTest is BaseTest {
                 sImd.totalSupply(),
                 sImd.balanceOf(address(stacker)),
                 sImd.balanceOf(address(sImd)),
+                sImd.balanceOf(address(imd)),
                 sImd.balanceOf(trader),
                 sImd.lastDepositBlock(address(stacker)),
                 sImd.lastDepositBlock(address(sImd)),
+                sImd.lastDepositBlock(address(imd)),
                 sImd.lastDepositBlock(trader)
             )
         );
